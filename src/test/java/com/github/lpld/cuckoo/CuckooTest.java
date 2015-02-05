@@ -44,11 +44,11 @@ public class CuckooTest {
 
   @Test
   public void testMultipleKeys() {
-    Map<String, String> simpleMap = new NotThreadSafeCuckooHashMap<String, String>(512);
+    Map<String, String> simpleMap = new ThreadSafeCuckooHashMap<String, String>(512);
 
     // more complex scenario:
 
-    final int itcount = 300;
+    final int itcount = 250;
 
     // putting values:
     for (int i = 0; i < itcount; i++) {
