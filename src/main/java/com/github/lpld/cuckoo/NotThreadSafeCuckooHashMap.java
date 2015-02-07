@@ -9,7 +9,6 @@ import java.util.Set;
  */
 public class NotThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
 
-
   private static final int DEFAULT_CAPACITY = 16;
   private static final int TABLES_COUNT = 2;
 

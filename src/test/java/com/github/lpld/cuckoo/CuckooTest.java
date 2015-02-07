@@ -3,6 +3,9 @@ package com.github.lpld.cuckoo;
 import org.junit.Test;
 
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -48,7 +51,7 @@ public class CuckooTest {
 
     // more complex scenario:
 
-    final int itcount = 250;
+    final int itcount = 340;
 
     // putting values:
     for (int i = 0; i < itcount; i++) {
@@ -84,5 +87,75 @@ public class CuckooTest {
 
       assertNull(simpleMap.get(key));
     }
+  }
+
+  @Test
+//  @Ignore
+  public void testParallelInsert() throws InterruptedException {
+    final Map<String, String> simpleMap = new ThreadSafeCuckooHashMap<String, String>(2048);
+//    final Map<String, String> simpleMap = new ConcurrentHashMap<String, String>();
+
+    final int threadsCount = 20;
+    final int iterations = 50;
+    final int expectedSize = threadsCount * iterations;
+
+    ExecutorService service = Executors.newFixedThreadPool(threadsCount);
+    final CountDownLatch start = new CountDownLatch(1);
+    final CountDownLatch end = new CountDownLatch(threadsCount);
+
+    for (int i = 0; i < threadsCount; i++) {
+
+      final int ii = i;
+      service.submit(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            start.await();
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+          }
+
+          try {
+            for (int j = 0; j < iterations; j++) {
+              int idx = ii + threadsCount * j;
+
+              final String key = "key_" + idx;
+              final String value = "value_" + idx;
+              System.out.println("[" + ii + "] PUT " + key + ":" + value);
+              assertNull(simpleMap.put(key, value));
+
+              int readIdx = (idx - threadsCount) % expectedSize;
+
+              System.out.println("[" + ii + "] READ key_" + readIdx);
+              String v = simpleMap.get("key_" + readIdx);
+              System.out.println("[" + ii + "] READ key_" + readIdx + ":" + v);
+
+              if (readIdx > idx || readIdx < 0) {
+                assertNull(v);
+              } else {
+                assertEquals("value_" + readIdx, v);
+              }
+
+            }
+          } finally {
+            end.countDown();
+          }
+
+        }
+      });
+    }
+
+    start.countDown();
+    end.await();
+
+
+    for (int i = 0; i < expectedSize; i++) {
+      int idx = i;
+      final String key = "key_" + idx;
+      final String value = "value_" + idx;
+      assertEquals(value, simpleMap.get(key));
+    }
+
+
   }
 }

@@ -3,6 +3,8 @@ package com.github.lpld.cuckoo;
 import java.util.AbstractMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
  * @author leopold
@@ -12,19 +14,26 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
 
 
   private static final int DEFAULT_CAPACITY = 16;
-  private static final int TABLES_COUNT = 2;
 
   int capacity;
 
   int MAX_ROUTE = 10;
 
-  Entry<K, V>[][] tables;
-  int[][] timestamps;
+  AtomicReferenceArray<Entry<K, V>>[] tables;
+  AtomicIntegerArray[] flags;
 
   public ThreadSafeCuckooHashMap(int capacity) {
     this.capacity = capacity;
-    tables = new Entry[TABLES_COUNT][capacity];
-    timestamps = new int[TABLES_COUNT][capacity];
+
+    this.tables = new AtomicReferenceArray[]{
+        new AtomicReferenceArray<Entry<K, V>>(capacity),
+        new AtomicReferenceArray<Entry<K, V>>(capacity)
+    };
+
+    this.flags = new AtomicIntegerArray[]{
+        new AtomicIntegerArray(capacity),
+        new AtomicIntegerArray(capacity)
+    };
   }
 
   public ThreadSafeCuckooHashMap() {
@@ -46,16 +55,17 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
       }
 
       if (findResult.e1 == null) {
-        // todo make it atomic
-
-        tables[0][idx1] = new Entry<K, V>(key, value);
-        return null;
+        if (tables[0].compareAndSet(idx1, null, new Entry<K, V>(key, value))) {
+          return null;
+        }
+        continue;
       }
 
       if (findResult.e2 == null) {
-        // todo make it atomic
-        tables[1][idx2] = new Entry<K, V>(key, value);
-        return null;
+        if (tables[1].compareAndSet(idx2, null, new Entry<K, V>(key, value))) {
+          return null;
+        }
+        continue;
       }
 
       // no room, relocation is needed
@@ -69,43 +79,197 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
 
   }
 
-  private boolean relocate(int table, int index) {
-    int[] route = new int[MAX_ROUTE];
+  private boolean checkCounters(int f1, int f2, int ff1, int ff2) {
 
-    boolean pathFound = false;
-    int depth = 0;
-    do {
-      Entry<K, V> e = tables[table][index];
-      if (e == null) {
-        pathFound = true;
-      } else {
-        route[depth] = index;
-        table = 1 - table;
-        int hash = table == 0 ? hash1(e.getKey()) : hash2(e.getKey());
-        index = indexFor(hash);
-        depth++;
+    boolean result = timestamp(ff1) - timestamp(f1) < 2 &&
+                     timestamp(ff2) - timestamp(f2) < 2 &&
+                     timestamp(ff2) - timestamp(f1) < 3;
+    if (!result) {
+      System.out.println("-- Counters differ");
+    }
+
+    return result;
+  }
+
+  private boolean relocate(final int table, final int index) {
+    int[] route = new int[MAX_ROUTE];
+    int startLevel = 0;
+
+    int tbl = table;
+    int idx = index;
+
+    while (true) {
+      int depth = getCuckooPath(route, startLevel, tbl, idx);
+
+      if (depth < 0) {
+        return false;
       }
 
+//       - 1;
 
-    } while (!pathFound && depth < MAX_ROUTE);
+      if (depth % 2 == 0)  {
+        tbl = 1 - tbl; // + 1 - (depth % 2);
 
-    if (!pathFound) {
+      }
+
+      boolean ok = true;
+
+      for (int i = depth - 1; i >= 0; i--, tbl = 1 - tbl) {
+        idx = route[i];
+        Entry<K, V> e = getAndRelocate(tbl, idx);
+        if (e == null) {
+          continue; // really ?
+        }
+
+        int hash = tbl == 0 ? hash2(e.getKey()) : hash1(e.getKey());
+        int destIndex = indexFor(hash);
+
+        Entry<K, V> old = tables[1 - tbl].get(destIndex);
+
+        if (old != null) {
+          startLevel = i + 1;
+          idx = destIndex;
+          tbl = 1 - tbl;
+          ok = false;
+          break;
+        }
+        helpRelocate(tbl, idx, true);
+
+      }
+
+      if (ok) {
+        return true;
+      }
+    }
+  }
+
+  private int getCuckooPath(int[] route, int startLevel, int table, int index) {
+
+    int depth = startLevel;
+    Entry<K, V> prev = null;
+    int prevIdx = -1;
+    while (true) {
+      Entry<K, V> e = getAndRelocate(table, index);
+
+      if (e == null) {
+        return depth;
+      }
+
+      if (prev != null && e.key.equals(prev.key)) {
+        if (table == 0) {
+          deleteDuplicate(prev, prevIdx);
+        } else {
+          deleteDuplicate(e, index);
+        }
+      }
+
+      route[depth] = index;
+      table = 1 - table;
+      int hash = table == 0 ? hash1(e.getKey()) : hash2(e.getKey());
+      index = indexFor(hash);
+      depth++;
+      prev = e;
+      prevIdx = index;
+
+      if (depth >= MAX_ROUTE) {
+        return -1;
+      }
+    }
+
+  }
+
+  private Entry<K, V> getAndRelocate(int table, int index) {
+    Entry<K, V> e;
+    int f;
+    int eFlags = -1;
+    do {
+      e = tables[table].get(index);
+      f = eFlags;
+      eFlags = flags[table].get(index);
+
+      if (f == eFlags && isMarked(eFlags)) {
+        helpRelocate(table, index, false);
+        f = -1;
+      }
+
+    } while (f != eFlags);
+
+    return e;
+  }
+
+  private boolean helpRelocate(int table, int index, boolean doMark) {
+    while (true) {
+
+      int f;
+
+      // read source and mark it for relocation
+      Entry<K, V> source;
+      int sFlags = -1;
+
+      do {
+        source = tables[table].get(index);
+
+        if (source == null) {
+          return true;
+        }
+
+        f = sFlags;
+        sFlags = flags[table].get(index);
+
+        if (f == sFlags && doMark && !isMarked(sFlags)) {
+          flags[table].compareAndSet(index, sFlags, mark(sFlags));
+          f = -1; // we need read source once again
+        }
+      } while (f != sFlags);
+
+      if (!isMarked(sFlags)) {
+        return true;
+      }
+
+      // read destination
+      Entry<K, V> dest;
+      int destTable = 1 - table;
+      int hash = destTable == 0 ? hash1(source.getKey()) : hash2(source.getKey());
+      int destIdx = indexFor(hash);
+      int dFlags = -1;
+
+      do {
+        dest = tables[destTable].get(destIdx);
+        f = dFlags;
+        dFlags = flags[destTable].get(destIdx);
+      } while (f != dFlags);
+
+      int sourceTs = timestamp(sFlags);
+      int destTs = timestamp(dFlags);
+
+      if (dest == null) {
+        int newTs = Math.max(sourceTs, destTs) + 1;
+        if (tables[table].get(index) != source) {
+          continue;
+        }
+
+        // updating destination
+        if (tables[destTable].compareAndSet(destIdx, null, source)) {
+          tables[table].compareAndSet(index, source, null); // setting source to null
+
+          // updating timestamps
+          flags[table].compareAndSet(index, sFlags, updateTimestamp(sFlags, sourceTs + 1));
+          flags[destTable].compareAndSet(destIdx, dFlags, updateTimestamp(dFlags, newTs));
+          return true;
+        }
+      }
+
+      // means that someone has already moved the entry
+      if (source == dest) {
+        tables[table].compareAndSet(index, source, null); // setting source to null
+        flags[table].compareAndSet(index, sFlags, updateTimestamp(sFlags, sourceTs + 1));
+        return true;
+      }
+
+      // unmarking
+      flags[table].compareAndSet(index, sFlags, unmark(sFlags));
       return false;
     }
-
-    table = 1 - table;
-    for (int i = depth - 1; i >= 0; i--, table = 1 - table) {
-      index = route[i];
-      Entry<K, V> e = tables[table][index];
-
-      int hash = table == 0 ? hash2(e.getKey()) : hash1(e.getKey());
-      int destIndex = indexFor(hash);
-
-      tables[1 - table][destIndex] = e;
-    }
-
-    return true;
-
   }
 
   @Override
@@ -113,58 +277,92 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
     int idx1 = indexFor(hash1(key));
     int idx2 = indexFor(hash2(key));
 
-    FindResult findResult = internalFind(key);
+    while (true) {
+      FindResult findResult = internalFind(key);
 
-    if (findResult.table == 0) {
-      tables[0][idx1] = new Entry<K, V>(findResult.e1.timestamp);
-      return findResult.e1.getValue();
-    } else if (findResult.table == 1) {
+      if (findResult.table == 0) {
+        if (tables[0]
+            .compareAndSet(idx1, findResult.e1, null)) {
+          return findResult.e1.getValue();
+        }
 
-      // todo why do we need this?
-      // if (table[0][h1]!=<ent1,ts1>)
-      // continue
+        continue;
+      }
 
-      tables[1][idx2] = new Entry<K, V>(findResult.e2.timestamp);;
-      return findResult.e2.getValue();
-    } else {
+      if (findResult.table == 1) {
+
+        // not sure why we need this:
+        if (tables[0].get(idx1) != findResult.e1) {
+          continue;
+        }
+
+        if (tables[1]
+            .compareAndSet(idx2, findResult.e2, null)) {
+          return findResult.e2.getValue();
+        }
+
+        continue;
+      }
+
       return null;
     }
+  }
 
+  private void deleteDuplicate(Entry<K, V> e2, int idx2) {
+    tables[0].compareAndSet(idx2, e2, null);
   }
 
   @Override
   public V get(Object key) {
-    boolean counterOk;
-    do {
-      int idx1 = indexFor(hash1(key));
-      Entry<K, V> e1 = tables[0][idx1];
+    int idx1 = indexFor(hash1(key));
+    int idx2 = 0;
+
+    Entry<K, V> e1;
+    Entry<K, V> e2;
+    int e1Flags = -1;
+    int e2Flags = -1;
+
+    int e1PrevFlags;
+    int e2PrevFlags;
+
+    boolean first = true;
+
+    while (true) {
+      e1PrevFlags = e1Flags;
+      e2PrevFlags = e2Flags;
+      int f;
+
+      do {
+        e1 = tables[0].get(idx1);
+        f = e1Flags;
+        e1Flags = flags[0].get(idx1);
+      } while (f != e1Flags);
+
       if (e1 != null && key.equals(e1.key)) {
         return e1.getValue();
       }
 
-      int idx2 = indexFor(hash2(key));
-      Entry<K, V> e2 = tables[1][idx2];
+      if (first) {
+        idx2 = indexFor(hash2(key));
+      }
+
+      do {
+        e2 = tables[1].get(idx2);
+        f = e2Flags;
+        e2Flags = flags[1].get(idx2);
+      } while (f != e2Flags);
+
       if (e2 != null && key.equals(e2.key)) {
         return e2.getValue();
       }
 
-      // trying once again.
-      Entry<K, V> ee1 = tables[0][idx1];
-      if (ee1 != null && key.equals(ee1.key)) {
-        return ee1.getValue();
+      if (first || !checkCounters(e1PrevFlags, e2PrevFlags, e1Flags, e2Flags)) {
+        first = false;
+        continue;
       }
 
-      Entry<K, V> ee2 = tables[1][idx2];
-      if (ee2 != null && key.equals(ee2.key)) {
-        return ee2.getValue();
-      }
-
-      // todo check timestamps
-      counterOk = true;
-
-    } while (!counterOk);
-
-    return null;
+      return null;
+    }
   }
 
   private FindResult internalFind(Object key) {
@@ -172,20 +370,31 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
     int idx2 = indexFor(hash2(key));
     int table = -1;
 
-    Entry<K, V> e1 = null;
-    Entry<K, V> e2 = null;
+    Entry<K, V> e1;
+    Entry<K, V> e2;
+    int e1Flags = -1;
+    int e2Flags = -1;
 
-    Entry<K, V> e1Prev;
-    Entry<K, V> e2Prev;
+    int e1PrevFlags;
+    int e2PrevFlags;
+
+    boolean first = true;
 
     while (true) {
-      e1Prev = e1;
-      e2Prev = e2;
+      e1PrevFlags = e1Flags;
+      e2PrevFlags = e2Flags;
+      int f;
 
-      e1 = tables[0][idx1];
-      if (!Entry.isNull(e1)) {
-        if (e1.isOngoingRelocation()) {
-          // help relocation
+      do {
+        e1 = tables[0].get(idx1);
+        f = e1Flags;
+        e1Flags = flags[0].get(idx1);
+      } while (f != e1Flags);
+
+      if (e1 != null) {
+        if (isMarked(e1Flags)) {
+          helpRelocate(0, idx1, false);
+          first = true;
           continue;
         }
 
@@ -194,17 +403,22 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
         }
       }
 
-      e2 = tables[1][idx2];
+      do {
+        e2 = tables[1].get(idx2);
+        f = e2Flags;
+        e2Flags = flags[1].get(idx2);
+      } while (f != e2Flags);
 
-      if (!Entry.isNull(e2)) {
-        if (e2.isOngoingRelocation()) {
-          // help relocate
+      if (e2 != null) {
+        if (isMarked(e2Flags)) {
+          helpRelocate(1, idx2, false);
+          first = true;
           continue;
         }
 
         if (e2.key.equals(key)) {
           if (table == 0) { // already found
-            // delete duplicate
+            deleteDuplicate(e2, idx2);
           } else {
             table = 1;
           }
@@ -215,13 +429,13 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
         return new FindResult(table, e1, e2);
       }
 
-//      if (checkCounter)
-      // continue;
+      if (first || !checkCounters(e1PrevFlags, e2PrevFlags, e1Flags, e2Flags)) {
+        first = false;
+        continue;
+      }
 
       return new FindResult(-1, e1, e2);
-
     }
-
   }
 
   @Override
@@ -236,20 +450,8 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
       this.value = value;
     }
 
-    public Entry(K key, V value, int timestamp) {
-      this.key = key;
-      this.value = value;
-      this.timestamp = timestamp;
-    }
-
-    public Entry(int timestamp) {
-      this.key = null;
-      this.timestamp = timestamp;
-    }
-
     private final K key;
     private V value;
-    private int timestamp;
 
     @Override
     public K getKey() {
@@ -267,14 +469,6 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
       this.value = value;
       return old;
     }
-
-    private static boolean isNull(Entry<?, ?> e) {
-      return e == null || e.getKey() == null;
-    }
-
-    private boolean isOngoingRelocation() {
-      return false;
-    }
   }
 
   private class FindResult {
@@ -290,14 +484,13 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
     }
   }
 
-  int hash1(Object key) {
+  static int hash2(Object key) {
     int h = key.hashCode();
 
     return h ^ (h >>> 16);
-
   }
 
-  int hash2(Object key) {
+  static int hash1(Object key) {
     int h = key.hashCode();
 
     h ^= (h >>> 20) ^ (h >>> 12);
@@ -308,5 +501,28 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
     return h & (capacity - 1);
   }
 
+  static boolean isMarked(int flags) {
+    return (flags & 1) == 1;
+  }
+
+  static int mark(int flags) {
+    return flags | 1;
+  }
+
+  static int markBit(int flags) {
+    return flags & 1;
+  }
+
+  static int unmark(int flags) {
+    return flags ^ 1;
+  }
+
+  static int timestamp(int flags) {
+    return flags >> 1;
+  }
+
+  static int updateTimestamp(int flags, int newTs) {
+    return newTs << 1 | (flags & 1);
+  }
 
 }
