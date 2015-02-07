@@ -2,7 +2,13 @@ package com.github.lpld.cuckoo;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -155,6 +161,59 @@ public class CuckooTest {
       final String value = "value_" + idx;
       assertEquals(value, simpleMap.get(key));
     }
+
+
+  }
+
+  @Test
+  public void anotherTest() throws InterruptedException {
+
+    final Map<String, String> map = new ThreadSafeCuckooHashMap<String, String>(16);
+//    final Map<String, String> map = new ConcurrentHashMap<String, String>(16);
+
+
+    final int threads = 200;
+    final List<String> values = new ArrayList<String>(threads);
+    final Set<String> prevValues = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    for (int i = 0; i < threads; i++) {
+      values.add("val" + i);
+    }
+
+    final String key = "KEY";
+
+    ExecutorService service = Executors.newFixedThreadPool(threads);
+    final CountDownLatch start = new CountDownLatch(1);
+    final CountDownLatch end = new CountDownLatch(threads);
+
+    for (int i = 0; i < threads; i++) {
+      final int ii = i;
+      service.submit(new Runnable() {
+
+        @Override
+        public void run() {
+          try {
+            start.await();
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+          }
+
+          String prev = map.put(key, values.get(ii));
+          if (prev != null) {
+            prevValues.add(prev);
+          }
+          end.countDown();
+        }
+      });
+    }
+
+    start.countDown();
+    end.await();
+
+    prevValues.add(map.get(key));
+
+    assertEquals(threads, prevValues.size());
+
 
 
   }
