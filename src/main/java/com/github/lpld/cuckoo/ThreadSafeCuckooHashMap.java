@@ -51,7 +51,12 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
 
       if (findResult.table >= 0) {
         Entry<K, V> e = findResult.table == 0 ? findResult.e1 : findResult.e2;
-        return e.setValue(value);
+        int idx = findResult.table == 0 ? idx1 : idx2;
+
+        if (tables[findResult.table].compareAndSet(idx, e, new Entry<K, V>(key, value))) {
+          return e.getValue();
+        }
+        continue;
       }
 
       if (findResult.e1 == null) {
@@ -451,7 +456,7 @@ public class ThreadSafeCuckooHashMap<K, V> extends AbstractMap<K, V> {
     }
 
     private final K key;
-    private V value;
+    private volatile V value;
 
     @Override
     public K getKey() {
